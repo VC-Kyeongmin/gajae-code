@@ -800,3 +800,55 @@ export async function discoverAndLoadExtensions(
 
 	return loadExtensions(allPaths, cwd, eventBus);
 }
+
+/** A user-level loose extension module, wrapped as a lazy factory for session bootstrap. */
+export interface DiscoveredUserLooseExtension {
+	name: string;
+	path: string;
+	factory: ExtensionFactory;
+}
+
+/**
+ * Discover USER-level loose extension modules from the agent extensions
+ * directory (`<agentDir>/extensions/`), wrapped as lazy factories.
+ *
+ * Ordinary session bootstrap quarantines general extension discovery (see
+ * sdk/session.ts); this helper is the opt-in exception behind the
+ * `extensions.userLoose` setting. It deliberately returns user-level native
+ * modules only — project-level loose extensions never auto-load into
+ * sessions, because any repository a session walks into would otherwise
+ * contribute executable code to it. Modules are imported lazily inside the
+ * returned factory so a broken file surfaces through the caller's
+ * per-extension error isolation instead of discovery itself.
+ */
+export async function discoverUserLooseExtensionFactories(
+	cwd: string,
+	disabledExtensionIds: string[] = [],
+	agentDir?: string,
+): Promise<DiscoveredUserLooseExtension[]> {
+	const discovered = await loadCapability<ExtensionModule>(extensionModuleCapability.id, {
+		cwd,
+		...(agentDir ? { agentDir } : {}),
+	});
+	const disabled = new Set(disabledExtensionIds);
+	const out: DiscoveredUserLooseExtension[] = [];
+	for (const ext of discovered.items) {
+		if (ext._source.provider !== "native") continue;
+		if (ext.level !== "user") continue;
+		if (disabled.has(`extension-module:${ext.name}`)) continue;
+		const extPath = ext.path;
+		out.push({
+			name: ext.name,
+			path: extPath,
+			factory: async api => {
+				const module = (await loadLegacyPiModule(extPath)) as LoadedExtensionModule;
+				const factory = getExtensionFactory(module);
+				if (!factory) {
+					throw new Error(`Extension does not export a valid factory function: ${extPath}`);
+				}
+				await factory(api);
+			},
+		});
+	}
+	return out;
+}

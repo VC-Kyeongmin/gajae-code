@@ -92,6 +92,8 @@ import type { CustomTool, CustomToolContext, CustomToolSessionEvent } from "../e
 import { CustomToolAdapter } from "../extensibility/custom-tools/wrapper";
 import {
 	createCustomToolSettings,
+	type DiscoveredUserLooseExtension,
+	discoverUserLooseExtensionFactories,
 	type ExtensionContext,
 	type ExtensionEvent,
 	type ExtensionFactory,
@@ -3365,10 +3367,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// MCP routing is scope-held; no process-global manager registration.
 
 		// General extension discovery is quarantined from the public SDK surface.
-		// Recognized hook conventions are the bounded exception: their descriptors
-		// normalize before import and then adapt into the authoritative ExtensionRunner.
+		// Recognized hook conventions are the bounded exception, as are opt-in
+		// user-level loose extensions behind the `extensions.userLoose` setting.
 		const inlineExtensions: ExtensionFactory[] = [...(options.extensions ?? [])];
 		const discoveredHookExtensions: Array<{ factory: ExtensionFactory; name: string }> = [];
+		const discoveredLooseExtensions: DiscoveredUserLooseExtension[] = [];
 		if (customTools.length > 0) {
 			inlineExtensions.push(createCustomToolsExtension(customTools));
 		}
@@ -3381,6 +3384,22 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				}
 			} catch (error) {
 				logger.warn("Failed to discover hook extensions", { error: safeErrorForLog(error) });
+			}
+		}
+
+		// Opt-in user-level loose extensions (`extensions.userLoose`): trusted,
+		// user-authored modules from the agent extensions directory only.
+		// Project-level loose extensions never auto-load.
+		if (!options.disableExtensionDiscovery && settings.get("extensions.userLoose")) {
+			try {
+				const loose = await discoverUserLooseExtensionFactories(
+					cwd,
+					settings.get("disabledExtensions") ?? [],
+					agentDir,
+				);
+				discoveredLooseExtensions.push(...loose);
+			} catch (error) {
+				logger.warn("Failed to discover user loose extensions", { error: safeErrorForLog(error) });
 			}
 		}
 
@@ -3656,6 +3675,27 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				entry.name,
 			);
 			extensionsResult.extensions.push(loaded);
+		}
+
+		// User loose extensions are user-authored code: isolate per extension so
+		// one broken module cannot take down session creation.
+		for (const entry of discoveredLooseExtensions) {
+			try {
+				const loaded = await loadExtensionFromFactory(
+					entry.factory,
+					cwd,
+					eventBus,
+					extensionsResult.runtime,
+					entry.name,
+				);
+				extensionsResult.extensions.push(loaded);
+			} catch (error) {
+				logger.warn("Failed to load user loose extension", {
+					name: entry.name,
+					path: entry.path,
+					error: safeErrorForLog(error),
+				});
+			}
 		}
 
 		// Process provider registrations queued during extension loading.

@@ -26,7 +26,9 @@ export {
 	validateFunctionHookTarget,
 } from "./function-hooks";
 export {
+	type DiscoveredUserLooseExtension,
 	discoverAndLoadExtensions,
+	discoverUserLooseExtensionFactories,
 	ExtensionRuntimeNotInitializedError,
 	loadExtensionFromFactory,
 	loadExtensions,

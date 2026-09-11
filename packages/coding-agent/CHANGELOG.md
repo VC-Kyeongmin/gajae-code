@@ -11,6 +11,7 @@
 ### Added
 
 - Successful macOS installs and updates can offer the optional experimental, third-party community Gajae Code App (#5140), defaulting to No. The shared installer requires canonical release checksums and a verified bundle/signature, skips installed apps and automation, and supports `GJC_NO_COMMUNITY_APP=1`; app failures leave GJC installed.
+- Opt-in user-level loose extension loading: the new `extensions.userLoose` setting (default `false`) makes session bootstrap load user-level loose extensions from `~/.gjc/agent/extensions/<name>/` as trusted in-process modules with per-extension error isolation, so a personal `before_agent_start` extension can append per-turn context (e.g. a recall/retrieval feed). Project-level loose extensions never auto-load; default sessions remain unchanged.
 
 ### Fixed
 - The `opencode-go/muse-spark-1.3-contributor` catalog row added in #5485 is now declared in the autorouting tier-map skip list, so `check:autorouting-map` and its CI gate pass again instead of failing on the unlabeled new key.

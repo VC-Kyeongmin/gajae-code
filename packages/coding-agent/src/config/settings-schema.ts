@@ -3868,6 +3868,14 @@ export const SETTINGS_SCHEMA = {
 		default: false,
 	},
 
+	// Extensions. Ordinary session bootstrap quarantines general extension
+	// discovery; user-level loose extensions load only under this explicit
+	// opt-in. Project-level loose extensions never auto-load into sessions.
+	"extensions.userLoose": {
+		type: "boolean",
+		default: false,
+	},
+
 	// ────────────────────────────────────────────────────────────────────────
 	// Providers
 	// ────────────────────────────────────────────────────────────────────────

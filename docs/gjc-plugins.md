@@ -25,6 +25,8 @@ Rule of thumb: one local surface → loose file; several surfaces you want to ve
 
 Import is a transaction, not discovery precedence: `/extensions` selects Claude Code or Codex plus project-local or user-global scope, previews the normalized result, then writes the accepted configuration into the selected canonical `.gjc` scope. Import UI and transaction behavior belong to #4291; this bundle contract neither activates foreign layouts at runtime nor implements that UI.
 
+Loose extensions do **not** auto-load into ordinary sessions: session bootstrap quarantines general extension discovery. The bounded opt-in is the `extensions.userLoose` setting (default `false`) — when enabled, user-level loose extensions (`~/.gjc/agent/extensions/<name>/`) load into every session as trusted in-process code with per-extension error isolation. Project-level loose extensions (`<project>/.gjc/extensions/`) never auto-load; they remain explicit import/plugin sources only.
+
 ## Manifest (`gajae-plugin.json`)
 
 ```json
