@@ -105,6 +105,7 @@ export interface PrepareModelProfileActivationOptions {
 				| "getSessionCanonicalVariant"
 				| "restoreSessionCanonicalVariant"
 				| "getConfiguredProviderIds"
+				| "isKnownProvider"
 			>
 		> & {
 			getError?: ModelRegistry["getError"];
@@ -983,19 +984,27 @@ export async function prepareModelProfileActivation(
 		// not a credential gap: diagnose it before any auth probing so the user
 		// is never sent to /login for a provider this binary cannot serve (for
 		// example a models.yml profile authored on a newer or custom build). A
-		// registry without configured-provider visibility keeps the legacy
+		// registry without provider visibility keeps the legacy
 		// credential diagnosis.
 		const configuredProviderIds = options.modelRegistry.getConfiguredProviderIds?.();
-		if (configuredProviderIds !== undefined) {
-			const unknownRequiredProviders = [
-				...new Set(
-					requiredProviders.filter(
-						provider => !isKnownProvider(provider) && !configuredProviderIds.includes(provider),
-					),
-				),
-			].sort();
-			if (unknownRequiredProviders.length > 0) {
-				throw new ModelProfileUnknownProviderError(profileLabel, unknownRequiredProviders);
+		if (configuredProviderIds !== undefined || options.modelRegistry.isKnownProvider !== undefined) {
+			const isProviderKnown = (provider: string): boolean =>
+				(options.modelRegistry.isKnownProvider?.(provider) ?? false) ||
+				isKnownProvider(provider) ||
+				configuredProviderIds?.includes(provider) === true;
+			const unknownRequiredProviders = new Set<string>();
+			for (const provider of requiredProviders) {
+				if (!alternativeSet.has(provider) && !isProviderKnown(provider)) unknownRequiredProviders.add(provider);
+			}
+			for (const group of alternativeGroups) {
+				if (group.some(isProviderKnown)) continue;
+				for (const provider of group) {
+					if (!isProviderKnown(provider)) unknownRequiredProviders.add(provider);
+				}
+			}
+			const unknownProviderIds = [...unknownRequiredProviders].sort();
+			if (unknownProviderIds.length > 0) {
+				throw new ModelProfileUnknownProviderError(profileLabel, unknownProviderIds);
 			}
 		}
 

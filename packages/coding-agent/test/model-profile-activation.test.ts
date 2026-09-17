@@ -1918,6 +1918,84 @@ describe("model profile activation", () => {
 		);
 	});
 
+	test("alternative groups only report unknown providers when every member is unknown", async () => {
+		const profile: ModelProfileDefinition = {
+			name: "alternative-provider-group",
+			requiredProviders: ["future-provider-x", "provider-a"],
+			alternativeProviderGroups: [["future-provider-x", "provider-a"]],
+			modelMapping: { default: "provider-a/default" },
+			source: "user",
+		};
+		const registry = {
+			...fakeRegistry({ missingProviders: ["future-provider-x"], profiles: [profile] }),
+			getConfiguredProviderIds: () => ["provider-a"],
+		} as unknown as ModelRegistry;
+
+		const prepared = await prepareModelProfileActivation({
+			session: fakeSession(),
+			modelRegistry: registry,
+			settings: Settings.isolated(),
+			profileName: profile.name,
+		});
+
+		expect(prepared.defaultModel).toMatchObject({ provider: "provider-a", id: "default" });
+	});
+
+	test("runtime-registered provider satisfies the unknown-provider gate", async () => {
+		const tempDir = TempDir.createSync("@gjc-profile-runtime-provider-");
+		const authStorage = await AuthStorage.create(`${tempDir.path()}/auth.db`);
+		const runtimeRegistry = new ModelRegistry(authStorage, `${tempDir.path()}/models.yml`);
+		try {
+			runtimeRegistry.registerProvider("runtime-provider", {
+				baseUrl: "https://runtime-provider.example.test/v1",
+				api: "openai-completions",
+				apiKey: "RUNTIME_PROVIDER_KEY",
+				models: [
+					{
+						id: "default",
+						name: "Runtime Default",
+						reasoning: false,
+						input: ["text"],
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+						contextWindow: 1000,
+						maxTokens: 1000,
+					},
+				],
+			});
+			expect(runtimeRegistry.isKnownProvider("runtime-provider")).toBe(true);
+
+			const profile: ModelProfileDefinition = {
+				name: "runtime-provider-profile",
+				requiredProviders: ["runtime-provider"],
+				modelMapping: { default: "runtime-provider/default" },
+				source: "user",
+			};
+			const baseRegistry = fakeRegistry({ profiles: [profile] });
+			const registry = {
+				...baseRegistry,
+				getConfiguredProviderIds: () => [],
+				isKnownProvider: runtimeRegistry.isKnownProvider.bind(runtimeRegistry),
+				getApiKeyForProvider: runtimeRegistry.getApiKeyForProvider.bind(runtimeRegistry),
+				getAll: runtimeRegistry.getAll.bind(runtimeRegistry),
+				getAvailable: runtimeRegistry.getAvailable.bind(runtimeRegistry),
+				getAvailableForProfileActivation: runtimeRegistry.getAvailableForProfileActivation.bind(runtimeRegistry),
+			} as unknown as ModelRegistry;
+
+			const prepared = await prepareModelProfileActivation({
+				session: fakeSession(),
+				modelRegistry: registry,
+				settings: Settings.isolated(),
+				profileName: profile.name,
+			});
+
+			expect(prepared.defaultModel).toMatchObject({ provider: "runtime-provider", id: "default" });
+		} finally {
+			await runtimeRegistry.dispose();
+			authStorage.close();
+			tempDir.removeSync();
+		}
+	});
+
 	test("apply rolls back runtime changes when persistence throws", async () => {
 		const session = fakeSession();
 		const settings = Settings.isolated({
