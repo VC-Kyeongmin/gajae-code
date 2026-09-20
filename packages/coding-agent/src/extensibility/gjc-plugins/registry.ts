@@ -426,6 +426,11 @@ async function acquireLock(lockPath: string): Promise<() => Promise<void>> {
 			if (raw !== null && holder && !registryLockHolderAlive(holder)) {
 				let evictable = holder.host !== null;
 				if (!evictable) {
+					// Legacy tokens carry no host, so the liveness probe above
+					// consulted this host's PID table for a lock that shared
+					// storage may have sourced from another host: a live remote
+					// holder older than the doubled window can still be evicted
+					// here. Transitional exposure — host-tagged tokens are immune.
 					const stat = await fs.stat(lockPath).catch(() => null);
 					evictable = stat !== null && Date.now() - stat.mtimeMs > LOCK_TIMEOUT_MS * 2;
 				}
@@ -435,9 +440,13 @@ async function acquireLock(lockPath: string): Promise<() => Promise<void>> {
 						// between the two reads is never evicted.
 						if ((await fs.readFile(lockPath, "utf8")) === raw) await fs.rm(lockPath, { force: true });
 					} catch {
-						// Raced with another evictor or a fresh holder; retry.
+						// Raced with another evictor or a fresh holder, or the
+						// removal itself failed (lockfile owned by another user,
+						// read-only mount, EBUSY/EPERM on Windows). Fall through
+						// to the shared deadline and backoff below either way: a
+						// removal that keeps failing must end in the bounded
+						// install_conflict timeout, never an unbounded spin.
 					}
-					continue;
 				}
 			}
 			if (Date.now() > deadline) {

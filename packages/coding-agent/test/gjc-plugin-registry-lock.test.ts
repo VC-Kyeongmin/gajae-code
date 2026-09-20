@@ -102,6 +102,34 @@ describe("GJC plugin registry lock recovery", () => {
 		await expect(fs.stat(lock)).rejects.toMatchObject({ code: "ENOENT" });
 	});
 
+	test("withRegistryLock stays bounded when an evictable lock cannot be removed", async () => {
+		const { cwd, lock } = await projectScope();
+		const pid = await deadPid();
+		const token = `${pid}-${os.hostname()}-${NONCE}`;
+		await fs.writeFile(lock, token, "utf8");
+
+		// A registry directory the owner cannot write (a root-installed
+		// writer, a restricted mount) makes every eviction rm fail while the
+		// holder stays provably dead. The acquisition must still terminate in
+		// the bounded install_conflict timeout — never spin past the deadline
+		// and the retry backoff without bound.
+		const root = path.dirname(lock);
+		await fs.chmod(root, 0o555);
+		try {
+			let code: string | undefined;
+			try {
+				await withRegistryLock("project", cwd, async () => {});
+			} catch (error) {
+				code = (error as GjcPluginLoadError).code;
+			}
+			expect(code).toBe("install_conflict");
+			// The unremovable lock is left in place for diagnostics.
+			await expect(fs.readFile(lock, "utf8")).resolves.toBe(token);
+		} finally {
+			await fs.chmod(root, 0o755);
+		}
+	}, 10_000);
+
 	test("withRegistryLock still fails closed on a fresh legacy lock with a dead pid", async () => {
 		const { cwd, lock } = await projectScope();
 		const pid = await deadPid();
