@@ -1,5 +1,6 @@
 import { createHash, randomBytes } from "node:crypto";
 import * as fs from "node:fs/promises";
+import * as os from "node:os";
 import * as path from "node:path";
 import { compileGjcPluginBundle } from "./compiler";
 import { migrateGjcPluginEntries } from "./migration";
@@ -323,22 +324,71 @@ export async function readRegistry(
 	if (!migrated.changed && discovered.length === 0) return registry;
 	// Re-check under the lock before persisting. Migration and legacy-root
 	// discovery are one transaction, never a normal runtime loader path.
-	return await withRegistryLock(scope, cwd, async () => {
-		const latest = await readRegistryRaw(scope, cwd);
-		const latestDiscovered = await discoverLegacyEntries(scope, cwd, latest.plugins);
-		const latestMigrated = await migrateGjcPluginEntries([...latest.plugins, ...latestDiscovered]);
-		if (latestMigrated.changed || latestDiscovered.length > 0) {
-			const next: GjcPluginRegistry = { ...latest, plugins: sortRegistryEntries(latestMigrated.entries) };
-			await writeRegistryUnlocked(next, cwd, scope);
-			return next;
+	// Contention (a concurrent install elsewhere) must not fail startup reads:
+	// the effective registry is already computed, so degrade to returning it
+	// unpersisted and let a later uncontended session write the migrated
+	// state. Mutating install paths keep their fail-loud install_conflict.
+	try {
+		return await withRegistryLock(scope, cwd, async () => {
+			const latest = await readRegistryRaw(scope, cwd);
+			const latestDiscovered = await discoverLegacyEntries(scope, cwd, latest.plugins);
+			const latestMigrated = await migrateGjcPluginEntries([...latest.plugins, ...latestDiscovered]);
+			if (latestMigrated.changed || latestDiscovered.length > 0) {
+				const next: GjcPluginRegistry = { ...latest, plugins: sortRegistryEntries(latestMigrated.entries) };
+				await writeRegistryUnlocked(next, cwd, scope);
+				return next;
+			}
+			return latest;
+		});
+	} catch (error) {
+		if (error instanceof GjcPluginLoadError && error.code === "install_conflict") {
+			return { ...registry, plugins: sortRegistryEntries(migrated.entries) };
 		}
-		return latest;
-	});
+		throw error;
+	}
+}
+
+const LOCK_NONCE_PATTERN = /^[0-9a-f]{16}$/;
+
+interface RegistryLockToken {
+	pid: number;
+	/** Host segment of a host-tagged token; null for legacy `pid-nonce` tokens. */
+	host: string | null;
+}
+
+function parseRegistryLockToken(raw: string): RegistryLockToken | null {
+	const parts = raw.trim().split("-");
+	if (parts.length < 2) return null;
+	const pid = Number(parts[0]);
+	const nonce = parts[parts.length - 1];
+	if (!Number.isInteger(pid) || pid <= 0 || !LOCK_NONCE_PATTERN.test(nonce)) return null;
+	// Hostnames may contain '-', so everything between the first and last
+	// segment is the host; a single middle segment that is empty (or absent)
+	// means a legacy token.
+	const host = parts.slice(1, -1).join("-");
+	return { pid, host: host.length > 0 ? host : null };
+}
+
+/**
+ * A holder is assumed alive unless provably dead: ourselves, a live PID
+ * (EPERM counts — the process exists under another user), or a lock written
+ * on another host (a project registry can live on shared storage, where a
+ * local PID probe would be meaningless) all stay fail-closed.
+ */
+function registryLockHolderAlive(holder: RegistryLockToken): boolean {
+	if (holder.pid === process.pid) return true;
+	if (holder.host !== null && holder.host !== os.hostname()) return true;
+	try {
+		process.kill(holder.pid, 0);
+		return true;
+	} catch (error) {
+		return (error as NodeJS.ErrnoException)?.code === "EPERM";
+	}
 }
 
 async function acquireLock(lockPath: string): Promise<() => Promise<void>> {
 	await fs.mkdir(path.dirname(lockPath), { recursive: true });
-	const token = `${process.pid}-${randomBytes(8).toString("hex")}`;
+	const token = `${process.pid}-${os.hostname()}-${randomBytes(8).toString("hex")}`;
 	const deadline = Date.now() + LOCK_TIMEOUT_MS;
 	for (;;) {
 		try {
@@ -362,10 +412,34 @@ async function acquireLock(lockPath: string): Promise<() => Promise<void>> {
 			};
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException)?.code !== "EEXIST") throw error;
-			// Fail-closed: never auto-evict an existing lock (a live holder may run
-			// longer than the timeout). Time out instead and leave the lock for
-			// diagnostics/manual cleanup. A lease/heartbeat protocol can be added
-			// later if automatic stale recovery becomes necessary.
+			// Stale recovery: a writer that died mid-transaction never releases
+			// its lock, and without recovery that lock poisons every later
+			// session until manual cleanup. Evict only a provably dead holder:
+			// a host-tagged token on this host, or a legacy `pid-nonce` token
+			// that is also older than two full acquire windows (legacy tokens
+			// cannot prove which host wrote them, and the doubled window keeps
+			// a lock that was fresh when this attempt started un-evictable for
+			// the attempt's whole lifetime). Live holders still fail closed
+			// below — they may legitimately outlive our timeout.
+			const raw = await fs.readFile(lockPath, "utf8").catch(() => null);
+			const holder = raw === null ? null : parseRegistryLockToken(raw);
+			if (raw !== null && holder && !registryLockHolderAlive(holder)) {
+				let evictable = holder.host !== null;
+				if (!evictable) {
+					const stat = await fs.stat(lockPath).catch(() => null);
+					evictable = stat !== null && Date.now() - stat.mtimeMs > LOCK_TIMEOUT_MS * 2;
+				}
+				if (evictable) {
+					try {
+						// Re-read before removing so a fresh holder that raced in
+						// between the two reads is never evicted.
+						if ((await fs.readFile(lockPath, "utf8")) === raw) await fs.rm(lockPath, { force: true });
+					} catch {
+						// Raced with another evictor or a fresh holder; retry.
+					}
+					continue;
+				}
+			}
 			if (Date.now() > deadline) {
 				throw new GjcPluginLoadError(
 					"install_conflict",
