@@ -2,6 +2,13 @@ import { createHash, randomBytes } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import {
+	exactUnlink,
+	linkNoReplacePath,
+	type NativeExactFileIdentity,
+	type NativeNoReplaceResult,
+	renameNoReplacePath,
+} from "@gajae-code/natives";
 import { compileGjcPluginBundle } from "./compiler";
 import { migrateGjcPluginEntries } from "./migration";
 import { gjcPluginProjectRoot, gjcPluginUserRoot } from "./paths";
@@ -11,6 +18,11 @@ const REGISTRY_FILENAME = "registry.json";
 const LOCK_FILENAME = "registry.lock";
 const LOCK_TIMEOUT_MS = 5000;
 const LOCK_RETRY_MS = 50;
+
+export const RegistryLockTestHooks: {
+	beforeEviction?: (lockPath: string, raw: string) => void | Promise<void>;
+	beforePublish?: (stagingPath: string, lockPath: string) => void | Promise<void>;
+} = {};
 
 export function registryRootForScope(scope: GjcPluginScope, cwd: string): string {
 	return scope === "user" ? gjcPluginUserRoot() : gjcPluginProjectRoot(cwd);
@@ -386,77 +398,141 @@ function registryLockHolderAlive(holder: RegistryLockToken): boolean {
 	}
 }
 
+async function captureRegistryLockIdentity(lockPath: string): Promise<NativeExactFileIdentity | null> {
+	try {
+		const [bytes, stat, parent] = await Promise.all([
+			fs.readFile(lockPath),
+			fs.lstat(lockPath, { bigint: true }),
+			fs.stat(path.dirname(lockPath), { bigint: true }),
+		]);
+		if (!stat.isFile()) return null;
+		return {
+			dev: stat.dev,
+			ino: stat.ino,
+			nlink: stat.nlink,
+			parentDev: parent.dev,
+			parentIno: parent.ino,
+			size: stat.size,
+			mtimeNs: stat.mtimeNs,
+			sha256: createHash("sha256").update(bytes).digest("hex"),
+		};
+	} catch (error) {
+		if (isEnoent(error)) return null;
+		throw error;
+	}
+}
+
+async function evictRegistryLock(lockPath: string, raw: string): Promise<boolean> {
+	const identity = await captureRegistryLockIdentity(lockPath);
+	if (!identity) return false;
+	const expectedHash = createHash("sha256").update(raw).digest("hex");
+	if (identity.sha256 !== expectedHash) return false;
+	await RegistryLockTestHooks.beforeEviction?.(lockPath, raw);
+	const result = exactUnlink(lockPath, {
+		...identity,
+		quarantineName: `${LOCK_FILENAME}.evict-${process.pid}-${randomBytes(4).toString("hex")}`,
+	});
+	return result.ok || result.code === "cleanup_pending";
+}
+
+function publishRegistryLock(stagingPath: string, lockPath: string): NativeNoReplaceResult {
+	let result = renameNoReplacePath(stagingPath, lockPath);
+	if (
+		!result.ok &&
+		result.mutationState === "not_committed" &&
+		(result.reason === "atomic_unavailable" || result.reason === "invalid_request")
+	) {
+		// linkat is the no-overwrite fallback on filesystems without a
+		// no-replace rename. Both paths expose the complete token only after the
+		// atomic claim, so a crash cannot publish an empty or partial lock.
+		result = linkNoReplacePath(stagingPath, lockPath);
+	}
+	return result;
+}
+
 async function acquireLock(lockPath: string): Promise<() => Promise<void>> {
 	await fs.mkdir(path.dirname(lockPath), { recursive: true });
 	const token = `${process.pid}-${os.hostname()}-${randomBytes(8).toString("hex")}`;
 	const deadline = Date.now() + LOCK_TIMEOUT_MS;
 	for (;;) {
+		const stagingPath = `${lockPath}.tmp-${process.pid}-${randomBytes(4).toString("hex")}`;
+		let publication: NativeNoReplaceResult | undefined;
 		try {
-			const handle = await fs.open(lockPath, "wx");
-			try {
-				await handle.writeFile(token);
-			} finally {
-				await handle.close();
-			}
-			let released = false;
-			return async () => {
-				if (released) return;
-				released = true;
-				// Owner-safe release: only remove the lock if it is still ours.
-				try {
-					const current = await fs.readFile(lockPath, "utf8");
-					if (current === token) await fs.rm(lockPath, { force: true });
-				} catch {
-					// Lock already gone; nothing to release.
-				}
-			};
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException)?.code !== "EEXIST") throw error;
-			// Stale recovery: a writer that died mid-transaction never releases
-			// its lock, and without recovery that lock poisons every later
-			// session until manual cleanup. Evict only a provably dead holder:
-			// a host-tagged token on this host, or a legacy `pid-nonce` token
-			// that is also older than two full acquire windows (legacy tokens
-			// cannot prove which host wrote them, and the doubled window keeps
-			// a lock that was fresh when this attempt started un-evictable for
-			// the attempt's whole lifetime). Live holders still fail closed
-			// below — they may legitimately outlive our timeout.
-			const raw = await fs.readFile(lockPath, "utf8").catch(() => null);
-			const holder = raw === null ? null : parseRegistryLockToken(raw);
-			if (raw !== null && holder && !registryLockHolderAlive(holder)) {
-				let evictable = holder.host !== null;
-				if (!evictable) {
-					// Legacy tokens carry no host, so the liveness probe above
-					// consulted this host's PID table for a lock that shared
-					// storage may have sourced from another host: a live remote
-					// holder older than the doubled window can still be evicted
-					// here. Transitional exposure — host-tagged tokens are immune.
-					const stat = await fs.stat(lockPath).catch(() => null);
-					evictable = stat !== null && Date.now() - stat.mtimeMs > LOCK_TIMEOUT_MS * 2;
-				}
-				if (evictable) {
+			await fs.writeFile(stagingPath, token, { encoding: "utf8", flag: "wx", mode: 0o600 });
+			await RegistryLockTestHooks.beforePublish?.(stagingPath, lockPath);
+			publication = publishRegistryLock(stagingPath, lockPath);
+			if (publication.ok) {
+				let released = false;
+				return async () => {
+					if (released) return;
+					released = true;
+					// Owner-safe release: only remove the lock if it is still ours.
 					try {
-						// Re-read before removing so a fresh holder that raced in
-						// between the two reads is never evicted.
-						if ((await fs.readFile(lockPath, "utf8")) === raw) await fs.rm(lockPath, { force: true });
+						const current = await fs.readFile(lockPath, "utf8");
+						if (current === token) await fs.rm(lockPath, { force: true });
 					} catch {
-						// Raced with another evictor or a fresh holder, or the
-						// removal itself failed (lockfile owned by another user,
-						// read-only mount, EBUSY/EPERM on Windows). Fall through
-						// to the shared deadline and backoff below either way: a
-						// removal that keeps failing must end in the bounded
-						// install_conflict timeout, never an unbounded spin.
+						// Lock already gone; nothing to release.
 					}
-				}
+				};
 			}
-			if (Date.now() > deadline) {
-				throw new GjcPluginLoadError(
-					"install_conflict",
-					`Timed out acquiring GJC plugin registry lock at ${lockPath}; remove it manually if no install is running`,
+			if (publication.reason !== "destination_exists") {
+				throw new Error(
+					`Failed to publish GJC plugin registry lock at ${lockPath}: ${publication.code ?? publication.reason}`,
 				);
 			}
-			await new Promise(resolve => setTimeout(resolve, LOCK_RETRY_MS));
+		} catch (error) {
+			if (publication?.reason === "destination_exists") {
+				// Continue into stale inspection below.
+			} else if (
+				publication === undefined &&
+				["EACCES", "EPERM"].includes((error as NodeJS.ErrnoException)?.code ?? "")
+			) {
+				// A read-only registry directory can still contain a lock left by a
+				// dead writer. Inspect that lock and return the normal bounded
+				// install_conflict rather than surfacing the staging-file permission
+				// error immediately.
+				const lockExists = await fs.stat(lockPath).then(
+					() => true,
+					(error: unknown) => !isEnoent(error),
+				);
+				if (!lockExists) throw error;
+			} else throw error;
+		} finally {
+			if (publication?.mutationState !== "unknown") await fs.rm(stagingPath, { force: true }).catch(() => {});
 		}
+
+		// Stale recovery: a writer that died mid-transaction never releases
+		// its lock, and without recovery that lock poisons every later
+		// session until manual cleanup. Evict only a provably dead holder:
+		// a host-tagged token on this host. Legacy `pid-nonce` tokens have no
+		// trustworthy host identity, so they always fail closed: a local PID
+		// probe cannot prove that a remote holder on shared storage is dead.
+		// Live holders still fail closed below — they may legitimately outlive
+		// our timeout.
+		const raw = await fs.readFile(lockPath, "utf8").catch(() => null);
+		const holder = raw === null ? null : parseRegistryLockToken(raw);
+		if (raw !== null && holder !== null && holder.host !== null && !registryLockHolderAlive(holder)) {
+			try {
+				// exactUnlink verifies the observed inode, parent, size, mtime,
+				// and bytes inside the removal primitive. A replacement published
+				// after this read is therefore never consumed by stale recovery.
+				await evictRegistryLock(lockPath, raw);
+			} catch {
+				// Raced with another evictor or a fresh holder, or the removal
+				// itself failed (lockfile owned by another user, read-only mount,
+				// EBUSY/EPERM on Windows). Fall through to the shared deadline
+				// and backoff below either way: a removal that keeps failing must
+				// end in the bounded install_conflict timeout, never an unbounded
+				// spin.
+			}
+		}
+		if (Date.now() > deadline) {
+			throw new GjcPluginLoadError(
+				"install_conflict",
+				`Timed out acquiring GJC plugin registry lock at ${lockPath}; remove it manually if no install is running`,
+			);
+		}
+		await new Promise(resolve => setTimeout(resolve, LOCK_RETRY_MS));
 	}
 }
 

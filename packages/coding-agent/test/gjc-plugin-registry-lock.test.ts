@@ -2,12 +2,19 @@ import { afterEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { readRegistry, registryRootForScope, withRegistryLock } from "../src/extensibility/gjc-plugins/registry";
+import {
+	RegistryLockTestHooks,
+	readRegistry,
+	registryRootForScope,
+	withRegistryLock,
+} from "../src/extensibility/gjc-plugins/registry";
 import type { GjcPluginLoadError, GjcPluginRegistry, GjcPluginScope } from "../src/extensibility/gjc-plugins/types";
 
 const tempDirs: string[] = [];
 
 afterEach(async () => {
+	RegistryLockTestHooks.beforeEviction = undefined;
+	RegistryLockTestHooks.beforePublish = undefined;
 	for (const dir of tempDirs.splice(0)) {
 		await fs.rm(dir, { recursive: true, force: true });
 	}
@@ -90,17 +97,68 @@ describe("GJC plugin registry lock recovery", () => {
 		await expect(fs.stat(lock)).rejects.toMatchObject({ code: "ENOENT" });
 	});
 
-	test("withRegistryLock evicts an aged legacy lock whose holder pid is dead", async () => {
+	test("withRegistryLock fails closed on an aged legacy lock with an unknown holder host", async () => {
 		const { cwd, lock } = await projectScope();
 		const pid = await deadPid();
 		await fs.writeFile(lock, `${pid}-${NONCE}`, "utf8");
 		const aged = new Date(Date.now() - 60_000);
 		await fs.utimes(lock, aged, aged);
 
-		await withRegistryLock("project", cwd, async () => {});
+		let code: string | undefined;
+		try {
+			await withRegistryLock("project", cwd, async () => {});
+		} catch (error) {
+			code = (error as GjcPluginLoadError).code;
+		}
 
+		expect(code).toBe("install_conflict");
+		await expect(fs.readFile(lock, "utf8")).resolves.toBe(`${pid}-${NONCE}`);
+	}, 10_000);
+
+	test("withRegistryLock never evicts a replacement published after stale inspection", async () => {
+		const { cwd, lock } = await projectScope();
+		const pid = await deadPid();
+		const staleToken = `${pid}-${os.hostname()}-${NONCE}`;
+		const replacementToken = `${process.pid}-${os.hostname()}-fedcba9876543210`;
+		await fs.writeFile(lock, staleToken, "utf8");
+
+		let replaced = false;
+		RegistryLockTestHooks.beforeEviction = async lockPath => {
+			if (replaced || lockPath !== lock) return;
+			replaced = true;
+			await fs.rm(lockPath);
+			await fs.writeFile(lockPath, replacementToken, "utf8");
+		};
+
+		let code: string | undefined;
+		try {
+			await withRegistryLock("project", cwd, async () => {});
+		} catch (error) {
+			code = (error as GjcPluginLoadError).code;
+		}
+
+		expect(replaced).toBe(true);
+		expect(code).toBe("install_conflict");
+		await expect(fs.readFile(lock, "utf8")).resolves.toBe(replacementToken);
+	}, 10_000);
+
+	test("publishes a complete lock only at the atomic claim", async () => {
+		const { cwd, lock } = await projectScope();
+		let interrupted = false;
+		RegistryLockTestHooks.beforePublish = async (stagingPath, lockPath) => {
+			if (interrupted || lockPath !== lock) return;
+			interrupted = true;
+			await expect(fs.readFile(stagingPath, "utf8")).resolves.toMatch(/^[0-9]+-.+-[0-9a-f]{16}$/);
+			await expect(fs.stat(lockPath)).rejects.toMatchObject({ code: "ENOENT" });
+			throw new Error("simulated publication interruption");
+		};
+
+		await expect(withRegistryLock("project", cwd, async () => {})).rejects.toThrow(
+			"simulated publication interruption",
+		);
+		expect(interrupted).toBe(true);
 		await expect(fs.stat(lock)).rejects.toMatchObject({ code: "ENOENT" });
-	});
+	}, 10_000);
 
 	test("withRegistryLock stays bounded when an evictable lock cannot be removed", async () => {
 		const { cwd, lock } = await projectScope();
