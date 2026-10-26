@@ -129,6 +129,51 @@ it("keeps the successor's transcript and resumes it after a rejected append", as
 	}
 });
 
+it("warns the operator once when the managed append fence rejects", async () => {
+	const root = await makeRoot();
+	const manager = SessionManager.create(root, SessionManager.managedDestination(root, path.join(root, "agent")));
+	const auth = await AuthStorage.create(path.join(root, "auth.db"));
+	const session = new AgentSession({
+		agent: new Agent(),
+		sessionManager: manager,
+		settings: Settings.isolated({ "compaction.enabled": false }),
+		modelRegistry: new ModelRegistry(auth, path.join(root, "models.yml")),
+	});
+	const notices: { level: string; message: string; source?: string }[] = [];
+	session.subscribe(event => {
+		if (event.type === "notice") notices.push({ level: event.level, message: event.message, source: event.source });
+	});
+	try {
+		manager.appendMessage({ role: "user", content: "original", timestamp: 1 });
+		await manager.ensureOnDisk();
+		const file = manager.getSessionFile();
+		if (!file) throw new Error("Missing transcript");
+		const winner = await Bun.file(file).text();
+		await Bun.write(`${file}.successor`, winner);
+		await fs.rename(`${file}.successor`, file);
+
+		// Every later append fails against the same sticky error; the operator is
+		// told once instead of the session running on without a transcript.
+		expect(() => manager.appendMessage({ role: "user", content: "loser-1", timestamp: 2 })).toThrow(
+			ManagedAppendIdentityMismatchError,
+		);
+		expect(() => manager.appendMessage({ role: "user", content: "loser-2", timestamp: 3 })).toThrow(
+			ManagedAppendIdentityMismatchError,
+		);
+		await Bun.sleep(10);
+		expect(notices).toEqual([
+			{
+				level: "error",
+				message: new ManagedAppendIdentityMismatchError("session.jsonl").operatorMessage,
+				source: "session-persistence",
+			},
+		]);
+	} finally {
+		await session.dispose();
+		auth.close();
+	}
+});
+
 it("retains close_unknown for a genuine managed append I/O failure", async () => {
 	const root = await makeRoot();
 	const manager = SessionManager.create(root, SessionManager.managedDestination(root, path.join(root, "agent")));

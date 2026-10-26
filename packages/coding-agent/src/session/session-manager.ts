@@ -7793,6 +7793,8 @@ export class SessionManager {
 	#persistError: Error | undefined;
 	#closeRetryOriginError: Error | undefined;
 	#persistErrorReported = false;
+	/** One-shot observer for the first persistence error (the operator-facing session surface). */
+	#persistErrorObserver: ((error: Error) => void) | undefined;
 	/** Defense-in-depth (#4443): one-shot warn for adjacent private thinking blocks in persisted assistant transcripts. */
 	#warnedAdjacentThinkingPersist = false;
 	#closeRetryPending = false;
@@ -12718,6 +12720,15 @@ export class SessionManager {
 	getAppendIdentityMismatch(): ManagedAppendIdentityMismatchError | undefined {
 		return this.#persistError instanceof ManagedAppendIdentityMismatchError ? this.#persistError : undefined;
 	}
+
+	/**
+	 * Observe the first persistence error of this manager so the owning session can
+	 * warn the operator instead of silently running without a transcript. Replacing
+	 * the observer detaches the previous one; the manager never retains the caller.
+	 */
+	setPersistErrorObserver(observer: ((error: Error) => void) | undefined): void {
+		this.#persistErrorObserver = observer;
+	}
 	#recordPersistError(err: unknown): Error {
 		const normalized = toError(err);
 		if (!this.#persistError) this.#persistError = normalized;
@@ -12728,6 +12739,13 @@ export class SessionManager {
 				error: normalized.message,
 				stack: normalized.stack,
 			});
+			try {
+				this.#persistErrorObserver?.(normalized);
+			} catch (observerError) {
+				logger.warn("Session persistence error observer failed", {
+					error: observerError instanceof Error ? observerError.message : String(observerError),
+				});
+			}
 		}
 		return normalized;
 	}
